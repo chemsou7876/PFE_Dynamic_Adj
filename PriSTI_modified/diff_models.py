@@ -80,19 +80,21 @@ class Guide_diff(nn.Module):
             ]
         )
 
-    def compute_dynamic_support(self, observed_data, observed_mask):
+    def compute_dynamic_support(self, observed_data, cond_mask):
         """
         Calcule le support dynamique pour ce batch.
 
+        FIX data leakage : cond_mask utilisé (pas observed_mask).
+
         Args:
             observed_data: (B, K, L) — données observées
-            observed_mask: (B, K, L) — masque d'observation
+            cond_mask    : (B, K, L) — masque conditionnel
 
         Returns:
             support: liste de 2 tenseurs (B, K, K) — [adj_fwd, adj_bwd]
         """
         # A_dynamic : (B, K, K)
-        adj_dynamic = self.dynamic_adj.compute_dynamic_adj(observed_data, observed_mask)
+        adj_dynamic = self.dynamic_adj.compute_dynamic_adj(observed_data, cond_mask)  # FIX
 
         # Normaliser comme compute_support_gwn mais par batch
         # adj_fwd : normalisation par ligne (row-stochastic)
@@ -118,17 +120,15 @@ class Guide_diff(nn.Module):
     def forward(self, x, side_info, diffusion_step, itp_x, cond_mask,
                 observed_data, observed_mask):
         """
-        CHANGEMENT 2 : Ajout de observed_data et observed_mask
-                        en arguments pour calculer A_dynamic
-
         Args:
-            x: input au diffusion model
-            side_info: embeddings temporels + spatiaux
+            x            : input au diffusion model
+            side_info    : embeddings temporels + spatiaux
             diffusion_step: timestep de diffusion t
-            itp_x: données interpolées (guidance)
-            cond_mask: masque conditionnel
-            observed_data: (B, K, L) — données observées (pour Layer 2)
-            observed_mask: (B, K, L) — masque (pour Layer 2)
+            itp_x        : données interpolées (guidance)
+            cond_mask    : masque conditionnel
+            observed_data: (B, K, L) — données observées (pour A_dynamic)
+            observed_mask: (B, K, L) — conservé en signature pour compatibilité,
+                           mais A_dynamic utilise cond_mask (FIX data leakage)
         """
         if self.is_itp:
             x = torch.cat([x, itp_x], dim=1)
@@ -149,7 +149,7 @@ class Guide_diff(nn.Module):
         #   support = self.compute_dynamic_support(data, mask)
         #   (différent pour chaque batch)
         # ════════════════════════════════════════════════════════
-        support = self.compute_dynamic_support(observed_data, observed_mask)
+        support = self.compute_dynamic_support(observed_data, cond_mask)   # FIX
 
         if self.is_itp:
             itp_x = itp_x.reshape(B, inputdim - 1, K * L)

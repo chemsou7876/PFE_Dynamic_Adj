@@ -109,7 +109,7 @@ class PriSTI(nn.Module):
         # ════════════════════════════════════════════════════════
         predicted = self.diffmodel(
             total_input, side_info, t, itp_info, cond_mask,
-            observed_data, observed_mask
+            observed_data, cond_mask    # FIX : cond_mask (pas observed_mask)
         )
 
         target_mask = observed_mask - cond_mask
@@ -174,7 +174,7 @@ class PriSTI(nn.Module):
                 predicted = self.diffmodel(
                     diff_input, side_info,
                     torch.tensor([t]).to(self.device), itp_info, cond_mask,
-                    observed_data, observed_mask
+                    observed_data, cond_mask    # FIX : cond_mask (pas observed_mask)
                 )
 
                 coeff1 = 1 / self.alpha_hat[t] ** 0.5

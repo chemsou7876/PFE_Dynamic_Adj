@@ -51,60 +51,78 @@ class DynamicAdjacency:
         print(f"   {self.n_sensors} capteurs, α={alpha}, β={beta}")
         print(f"   A_static non-zero: {(self.A_static > 0).sum().item()}")
 
-    def compute_quality_score(self, observed_mask):
+    def compute_quality_score(self, cond_mask, observed_data=None):
         """
         Étape 2a : Calcul du quality score par capteur.
-        
+
+        FIX data leakage : paramètre renommé cond_mask (pas observed_mask).
+        FIX quality score : combine disponibilité + détection d'anomalies.
+
         Args:
-            observed_mask: (B, K, L) — 1 si observé, 0 si manquant
-            
+            cond_mask    : (B, K, L) — masque conditionnel (valeurs utilisées
+                           comme contexte, sans les cibles d'imputation)
+            observed_data: (B, K, L) — données observées pour anomaly detection
+
         Returns:
             quality: (B, K) — score entre 0 et 1 par capteur
         """
-        B, K, L = observed_mask.shape
+        # 1. Disponibilité : proportion de timesteps observés sous cond_mask
+        availability = cond_mask.float().mean(dim=-1)  # (B, K)
 
-        # 1. Availability = proportion de valeurs observées
-        availability = observed_mask.mean(dim=-1)  # (B, K)
+        # 2. Anomaly score : proportion de valeurs dans la plage [μ - 3σ, μ + 3σ]
+        if observed_data is not None:
+            # var_mean et var_std shape (K,) → expand pour batch et temps
+            mean_k = self.var_mean.unsqueeze(0).unsqueeze(-1)  # (1, K, 1)
+            std_k  = self.var_std.unsqueeze(0).unsqueeze(-1)   # (1, K, 1)
 
-        # 2. Anomaly detection (on ne peut pas la calculer ici car on n'a pas
-        #    les vraies valeurs pour les données manquantes, donc on utilise
-        #    seulement l'availability pour l'instant)
-        #    Note: en version complète, on comparerait la variance locale
-        #    avec self.anomaly_threshold
+            z_score  = (observed_data - mean_k) / std_k.clamp(min=1e-8)  # (B, K, L)
+            in_range = (z_score.abs() <= 3.0).float()                     # (B, K, L)
 
-        # quality_score = availability (simplifié pour le premier test)
-        quality = availability  # (B, K)
+            # Score uniquement sur les timesteps observés (cond_mask = 1)
+            mask_f        = cond_mask.float()
+            n_obs         = mask_f.sum(dim=-1).clamp(min=1)                # (B, K)
+            anomaly_score = (in_range * mask_f).sum(dim=-1) / n_obs        # (B, K)
+        else:
+            anomaly_score = torch.ones_like(availability)
+
+        # Score final : disponibilité × plausibilité
+        quality = availability * anomaly_score  # (B, K)
 
         return quality
 
-    def compute_local_correlation(self, observed_data, observed_mask):
+    def compute_local_correlation(self, observed_data, cond_mask):
         """
         Étape 2b : Corrélation de Pearson locale entre capteurs.
-        
+
+        FIX data leakage : utilise cond_mask (pas observed_mask),
+        ce qui garantit que les cibles d'imputation n'influencent pas
+        la corrélation calculée.
+
         Args:
             observed_data: (B, K, L) — données observées (normalisées)
-            observed_mask: (B, K, L) — masque d'observation
-            
+            cond_mask    : (B, K, L) — masque conditionnel
+
         Returns:
             corr: (B, K, K) — matrice de corrélation locale
         """
         B, K, L = observed_data.shape
 
-        # Masquer les données non observées
-        masked_data = observed_data * observed_mask  # (B, K, L)
+        # Masquer les données non observées (avec cond_mask)
+        mask        = cond_mask.float()                            # FIX
+        masked_data = observed_data * mask                         # FIX
 
         # Nombre de co-observations par paire
-        co_obs = torch.bmm(observed_mask, observed_mask.transpose(1, 2))  # (B, K, K)
+        co_obs = torch.bmm(mask, mask.transpose(1, 2))            # FIX
 
         # Somme des valeurs observées
         sum_x = masked_data.sum(dim=-1, keepdim=True)  # (B, K, 1)
 
-        # Moyenne (seulement sur les valeurs observées)
-        n_obs = observed_mask.sum(dim=-1, keepdim=True).clamp(min=1)  # (B, K, 1)
+        # Moyenne (seulement sur les valeurs observées sous cond_mask)
+        n_obs  = mask.sum(dim=-1, keepdim=True).clamp(min=1)      # FIX
         mean_x = sum_x / n_obs  # (B, K, 1)
 
         # Centrer les données
-        centered = (masked_data - mean_x) * observed_mask  # (B, K, L)
+        centered = (masked_data - mean_x) * mask                  # FIX
 
         # Covariance
         cov = torch.bmm(centered, centered.transpose(1, 2))  # (B, K, K)
@@ -127,28 +145,30 @@ class DynamicAdjacency:
 
         return corr  # (B, K, K)
 
-    def compute_dynamic_adj(self, observed_data, observed_mask):
+    def compute_dynamic_adj(self, observed_data, cond_mask):
         """
         Étape 2c : Construction de A_dynamic.
-        
+
+        FIX data leakage : cond_mask utilisé partout (pas observed_mask).
+
         La formule complète :
         A_dynamic(i,j,t) = [α × A_static(i,j) + β × local_corr(i,j,t)]
                            × quality_score(j, t)
-        
+
         Args:
             observed_data: (B, K, L) — données observées
-            observed_mask: (B, K, L) — masque d'observation
-            
+            cond_mask    : (B, K, L) — masque conditionnel
+
         Returns:
             adj_dynamic: (B, K, K) — adjacence dynamique par batch
         """
         B, K, L = observed_data.shape
 
-        # Étape 2a : Quality score
-        quality = self.compute_quality_score(observed_mask)  # (B, K)
+        # Étape 2a : Quality score (avec anomaly detection)
+        quality = self.compute_quality_score(cond_mask, observed_data)       # FIX
 
         # Étape 2b : Corrélation locale
-        local_corr = self.compute_local_correlation(observed_data, observed_mask)  # (B, K, K)
+        local_corr = self.compute_local_correlation(observed_data, cond_mask) # FIX
 
         # Étape 2c : Fusion
         # A_static est (K, K), on l'expand pour le batch
